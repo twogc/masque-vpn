@@ -29,7 +29,6 @@ type Server struct {
 
 // New создает новый экземпляр сервера
 func New(config common.ServerConfig) (*Server, error) {
-	// Создаем IP пул
 	networkInfo, err := common.NewNetworkInfo(config.AssignCIDR)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create network info: %w", err)
@@ -37,7 +36,6 @@ func New(config common.ServerConfig) (*Server, error) {
 
 	ipPool := common.NewIPPool(networkInfo.GetPrefix(), networkInfo.GetGateway().Addr())
 
-	// Создаем TUN устройство (опционально)
 	var tunDev *common.TUNDevice
 	if config.TunName != "" {
 		tunDev, err = common.CreateTunDevice(config.TunName, net.IPNet{
@@ -52,10 +50,9 @@ func New(config common.ServerConfig) (*Server, error) {
 		log.Printf("TUN device disabled (empty tun_name)")
 	}
 
-	// Инициализируем метрики
 	metrics := NewMetrics()
 	if tunDev != nil {
-		metrics.TunInterfaceStatus.Set(1) // TUN устройство активно
+		metrics.TunInterfaceStatus.Set(1)
 	}
 
 	server := &Server{
@@ -67,7 +64,6 @@ func New(config common.ServerConfig) (*Server, error) {
 		Metrics:     metrics,
 	}
 
-	// Создаем API сервер
 	apiServer, err := NewAPIServer(server)
 	if err != nil {
 		if tunDev != nil {
@@ -77,7 +73,6 @@ func New(config common.ServerConfig) (*Server, error) {
 	}
 	server.APIServer = apiServer
 
-	// Запускаем обработчик пакетов только если есть TUN устройство
 	if tunDev != nil {
 		go server.processPackets()
 		log.Printf("TUN Device: %s", tunDev.Name())
@@ -95,53 +90,43 @@ func New(config common.ServerConfig) (*Server, error) {
 
 // Run запускает сервер
 func (s *Server) Run(ctx context.Context) error {
-	// Настраиваем TLS
 	tlsConfig, err := s.setupTLSConfig()
 	if err != nil {
 		return fmt.Errorf("failed to setup TLS: %w", err)
 	}
 
-	// Настраиваем QUIC
 	quicConf := &quic.Config{
 		EnableDatagrams: true,
 		MaxIdleTimeout:  60 * time.Second,
 		KeepAlivePeriod: 30 * time.Second,
 	}
 
-	// Создаем HTTP/3 сервер
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.handleMASQUERequest)
-	
-	// Добавляем эндпоинт для метрик
-	mux.Handle("/metrics", s.createMetricsHandler())
-	
-	// Добавляем эндпоинт для проверки здоровья
-	mux.HandleFunc("/health", s.handleHealthCheck)
+	// Временный режим для диагностики:
+	// все HTTP/3 запросы напрямую идут в handleMASQUERequest,
+	// без http.ServeMux, чтобы он не делал redirect 301.
+	handler := http.HandlerFunc(s.handleMASQUERequest)
 
 	server := &http3.Server{
 		Addr:       s.Config.ListenAddr,
-		Handler:    mux,
+		Handler:    handler,
 		TLSConfig:  tlsConfig,
 		QUICConfig: quicConf,
 	}
 
 	log.Printf("MASQUE VPN Server listening on %s", s.Config.ListenAddr)
 	log.Printf("API Server will start on %s", s.Config.APIServer.ListenAddr)
-	
-	// Запускаем API сервер в отдельной горутине
+
 	go func() {
 		if err := s.APIServer.Start(); err != nil {
 			log.Printf("API Server error: %v", err)
 		}
 	}()
-	
-	// Запускаем MASQUE сервер в отдельной горутине
+
 	errChan := make(chan error, 1)
 	go func() {
 		errChan <- server.ListenAndServe()
 	}()
 
-	// Ждем завершения или ошибки
 	select {
 	case err := <-errChan:
 		return err
@@ -160,9 +145,6 @@ func (s *Server) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
 
 // createMetricsHandler создает обработчик для метрик Prometheus
 func (s *Server) createMetricsHandler() http.Handler {
-	// Импортируем prometheus handler
-	// return promhttp.Handler()
-	// Пока что простая заглушка
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("Metrics endpoint"))
@@ -172,8 +154,7 @@ func (s *Server) createMetricsHandler() http.Handler {
 // Close закрывает сервер и освобождает ресурсы
 func (s *Server) Close() error {
 	log.Printf("Closing MASQUE VPN Server...")
-	
-	// Закрываем все клиентские соединения
+
 	s.IPPoolMu.Lock()
 	for clientID, ip := range s.ClientIPMap {
 		if session, exists := s.IPConnMap[ip]; exists {
@@ -185,7 +166,6 @@ func (s *Server) Close() error {
 	}
 	s.IPPoolMu.Unlock()
 
-	// Закрываем TUN устройство
 	if s.TunDev != nil {
 		if err := s.TunDev.Close(); err != nil {
 			log.Printf("Error closing TUN device: %v", err)
@@ -193,7 +173,6 @@ func (s *Server) Close() error {
 		s.Metrics.TunInterfaceStatus.Set(0)
 	}
 
-	// Закрываем API сервер
 	if s.APIServer != nil {
 		if err := s.APIServer.Close(); err != nil {
 			log.Printf("Error closing API server: %v", err)
